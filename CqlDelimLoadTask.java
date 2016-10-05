@@ -15,25 +15,18 @@
  */
 package com.datastax.loader;
 
+import com.datastax.driver.core.*;
+import com.datastax.driver.dse.DseSession;
+import com.datastax.driver.dse.graph.GraphStatement;
+import com.datastax.driver.dse.graph.SimpleGraphStatement;
 import com.datastax.loader.parser.BooleanParser;
 import com.datastax.loader.futures.FutureManager;
 import com.datastax.loader.futures.PrintingFutureSet;
 
 import java.lang.System;
 import java.lang.String;
-import java.lang.StringBuilder;
-import java.lang.Integer;
-import java.lang.Runtime;
+import java.util.LinkedList;
 import java.util.List;
-import java.util.ArrayList;
-import java.util.Map;
-import java.util.HashMap;
-import java.util.Set;
-import java.util.HashSet;
-import java.util.Deque;
-import java.util.ArrayDeque;
-import java.util.Comparator;
-import java.util.Arrays;
 import java.util.Locale;
 import java.io.File;
 import java.io.BufferedReader;
@@ -44,33 +37,21 @@ import java.io.FileOutputStream;
 import java.io.BufferedOutputStream;
 import java.io.PrintStream;
 import java.text.ParseException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Callable;
-import java.util.concurrent.Future;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
-
-import com.datastax.driver.core.Cluster;
-import com.datastax.driver.core.Session;
-import com.datastax.driver.core.ProtocolVersion;
-import com.datastax.driver.core.PreparedStatement;
-import com.datastax.driver.core.ConsistencyLevel;
-import com.datastax.driver.core.BoundStatement;
-import com.datastax.driver.core.BatchStatement;
-import com.datastax.driver.core.ResultSetFuture;
-import com.datastax.driver.core.policies.TokenAwarePolicy;
-import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 class CqlDelimLoadTask implements Callable<Long> {
     private String BADPARSE = ".BADPARSE";
     private String BADINSERT = ".BADINSERT";
     private String LOG = ".LOG";
     private Session session;
+	private DseSession graphSession;
     private String insert;
     private PreparedStatement statement;
     private ConsistencyLevel consistencyLevel;
@@ -106,18 +87,18 @@ class CqlDelimLoadTask implements Callable<Long> {
     private long insertErrors = 0;
     private boolean nullsUnset;
 
-    public CqlDelimLoadTask(String inCqlSchema, String inDelimiter, 
-			    String inNullString, String inDateFormatString,
-			    BooleanParser.BoolStyle inBoolStyle, 
-			    Locale inLocale, 
-			    long inMaxErrors, long inSkipRows, 
-			    String inSkipCols, long inMaxRows,
-			    String inBadDir, File inFile,
-			    Session inSession, ConsistencyLevel inCl,
-			    int inNumFutures, int inBatchSize, int inNumRetries, 
-			    int inQueryTimeout, long inMaxInsertErrors,
-			    String inSuccessDir, String inFailureDir,
-			    boolean inNullsUnset) {
+    public CqlDelimLoadTask(String inCqlSchema, String inDelimiter,
+                            String inNullString, String inDateFormatString,
+                            BooleanParser.BoolStyle inBoolStyle,
+                            Locale inLocale,
+                            long inMaxErrors, long inSkipRows,
+                            String inSkipCols, long inMaxRows,
+                            String inBadDir, File inFile,
+                            Session inSession, ConsistencyLevel inCl,
+                            int inNumFutures, int inBatchSize, int inNumRetries,
+                            int inQueryTimeout, long inMaxInsertErrors,
+                            String inSuccessDir, String inFailureDir,
+                            boolean inNullsUnset, DseSession graphInSession) {
 	super();
 	cqlSchema = inCqlSchema;
 	delimiter = inDelimiter;
@@ -132,6 +113,7 @@ class CqlDelimLoadTask implements Callable<Long> {
 	badDir = inBadDir;
 	infile = inFile;
 	session = inSession;
+	graphSession = graphInSession;
 	consistencyLevel = inCl;
 	numFutures = inNumFutures;
 	batchSize = inBatchSize;
@@ -145,7 +127,7 @@ class CqlDelimLoadTask implements Callable<Long> {
 
     public Long call() throws IOException, ParseException {
 	setup();
-	numInserted = execute();
+	numInserted = execute(cqlSchema, graphSession);
 	return numInserted;
     }
 
@@ -174,7 +156,9 @@ class CqlDelimLoadTask implements Callable<Long> {
 	statement = session.prepare(insert);
 	statement.setRetryPolicy(new LoaderRetryPolicy(numRetries));
 	statement.setConsistencyLevel(consistencyLevel);
-    }
+
+
+	}
 	
     private void cleanup(boolean success) throws IOException {
 	if (null != badParsePrinter)
@@ -201,7 +185,7 @@ class CqlDelimLoadTask implements Callable<Long> {
 	}
     }
 
-    private long execute() throws IOException {
+    private long execute(String cqlSchema, DseSession graphSession) throws IOException, ParseException {
 	FutureManager fm = new PrintingFutureSet(numFutures, queryTimeout, 
 						 maxInsertErrors, 
 						 logPrinter, 
@@ -214,12 +198,22 @@ class CqlDelimLoadTask implements Callable<Long> {
 	BatchStatement batch = new BatchStatement(BatchStatement.Type.UNLOGGED);
 	ResultSetFuture resultSetFuture = null;
 	BoundStatement bind = null;
+
+
 	List<Object> elements;
 
-	System.err.println("*** Processing " + readerName);
-		System.out.println("started processing time:" +System.currentTimeMillis());
-	while ((line = reader.readLine()) != null) {
-	    lineNumber++;
+		String kstnRegex = "^\\s*(\\\"?[A-Za-z0-9_]+\\\"?)\\.(\\\"?[A-Za-z0-9_]+\\\"?)\\s*[\\(]\\s*(\\\"?[A-Za-z0-9_]+\\\"?\\s*(,\\s*\\\"?[A-Za-z0-9_]+\\\"?\\s*)*)[\\)]\\s*$";
+		Pattern p = Pattern.compile(kstnRegex);
+		Matcher m = p.matcher(cqlSchema);
+		if (!m.find()) {
+			throw new ParseException("Badly formatted schema  " + cqlSchema, 0);
+		}
+		String schemaString = m.group(3);
+		System.out.println("the contents is:" +schemaString);
+		String[] coloumnList = schemaString.split(",");
+
+		while ((line = reader.readLine()) != null) {
+		lineNumber++;
 	    if (skipRows > 0) {
 		skipRows--;
 		continue;
@@ -231,7 +225,11 @@ class CqlDelimLoadTask implements Callable<Long> {
 		continue;
 		
 	    if (null != (elements = cdp.parse(line))) {
+		graphInsert(graphSession, coloumnList, line);	//graph loading
 		bind = statement.bind(elements.toArray());
+
+
+
 		if (nullsUnset) {
 		    for (int i = 0; i < elements.size(); i++)
 			if (null == elements.get(i))
@@ -248,6 +246,7 @@ class CqlDelimLoadTask implements Callable<Long> {
 		}
 		else {
 		    batch.add(bind);
+
 		    if (batchSize == batch.size()) {
 			resultSetFuture = session.executeAsync(batch);
 			if (!fm.add(resultSetFuture, line)) {
@@ -297,8 +296,43 @@ class CqlDelimLoadTask implements Callable<Long> {
 	    logPrinter.println("*** DONE: " + readerName + "  number of lines processed: " + lineNumber + " (" + numInserted + " inserted)");
 	}
 	System.err.println("*** DONE: " + readerName + "  number of lines processed: " + lineNumber + " (" + numInserted + " inserted)");
-		System.out.println("after processing the file:"+System.currentTimeMillis());
+
 	cleanup(true);
 	return fm.getNumInserted();
     }
+
+	private void graphInsert(DseSession graphSession, String[] list, String line) {
+		String[] elements = line.split(",");
+      try{
+		  if (elements !=null){
+			  System.out.println("graph processing starts:");
+			  List<String> lineSplit = new LinkedList<>();
+			  for (String object : elements){
+				  lineSplit.add(object);
+			  }
+			  if (list.length<=0){
+				  System.out.println("coloumn header is empty:");
+				  System.exit(-1);
+			  }
+			  System.out.println("preparing the simple graph query:");
+			  String query = "def vmme = graph.addVertex(label,'VMME'," + "'" +"IP"+"'"+ "," +"'" + lineSplit.get(2) + "'" + ")" + "\n" +
+					  "def gwts = graph.addVertex(label,'GWTS',"  + "'" +"IP"+"'"+ "," + "'" +lineSplit.get(3)+ "'" + ")" + "\n" +
+					  "def imsi = graph.addVertex(label,'IMSI',"  + "'" +"IMSINum"+"'"+ "," + "'" +lineSplit.get(8)+ "'" + ")" + "\n" +
+					  "def tai = graph.addVertex(label,'TrackingArea',"  + "'" +"TAI"+"'"+ "," + "'" +lineSplit.get(11)+ "'" + ")" + "\n" +
+					  "def cellId = graph.addVertex(label,'CellID',"  + "'" +"CID"+"'"+ "," + "'" +lineSplit.get(12)+ "'" + ")" + "\n" +
+
+					  "imsi.addEdge('RAN',cellId,'BT',"  + "'" +lineSplit.get(1) +"'" + "," + "'" +"TS" + "'" + "," +"'" +lineSplit.get(0) +"'"+ ")" +"\n" +
+					  "cellId.addEdge('Location',tai)" + "\n" +
+					  "tai.addEdge('Route',vmme)" + "\n" +
+					  "vmme.addEdge('SGSLite',gwts)";
+			  SimpleGraphStatement simpleGraphStatement = new SimpleGraphStatement(query);
+			  graphSession.executeGraph(simpleGraphStatement);
+
+			  System.out.println("graph processing ends...");
+		  }
+
+	  }catch (Exception e){
+		  System.out.println("Eception occured:"+e);
+	  }
+	}
 }

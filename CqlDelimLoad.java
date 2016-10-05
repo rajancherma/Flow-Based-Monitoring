@@ -15,9 +15,10 @@
  */
 package com.datastax.loader;
 
+import com.datastax.driver.dse.DseCluster;
+import com.datastax.driver.dse.DseSession;
+import com.datastax.driver.dse.graph.GraphOptions;
 import com.datastax.loader.parser.BooleanParser;
-import com.datastax.loader.futures.FutureManager;
-import com.datastax.loader.futures.PrintingFutureSet;
 
 import java.lang.System;
 import java.lang.String;
@@ -25,8 +26,6 @@ import java.lang.StringBuilder;
 import java.lang.Integer;
 import java.lang.Runtime;
 import java.lang.Boolean;
-import java.util.List;
-import java.util.ArrayList;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Set;
@@ -39,7 +38,6 @@ import java.util.Locale;
 import java.io.File;
 import java.io.BufferedReader;
 import java.io.FileReader;
-import java.io.InputStreamReader;
 import java.io.IOException;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -53,11 +51,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.security.KeyStoreException;
@@ -74,18 +67,12 @@ import com.datastax.driver.core.Metrics;
 import com.datastax.driver.core.Session;
 import com.datastax.driver.core.ProtocolVersion;
 import com.datastax.driver.core.PoolingOptions;
-import com.datastax.driver.core.ProtocolOptions;
 import com.datastax.driver.core.HostDistance;
-import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ConsistencyLevel;
-import com.datastax.driver.core.BoundStatement;
-import com.datastax.driver.core.ResultSetFuture;
 import com.datastax.driver.core.SSLOptions;
 import com.datastax.driver.core.JdkSSLOptions;
 import com.datastax.driver.core.policies.TokenAwarePolicy;
 import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
-
-import com.codahale.metrics.Timer;
 
 public class CqlDelimLoad {
     private String version = "0.0.20";
@@ -98,7 +85,9 @@ public class CqlDelimLoad {
     private String keystorePath = null;
     private String keystorePwd = null;
     private Cluster cluster = null;
+	private DseCluster graphCluster = null;
     private Session session = null;
+	private DseSession graphSession = null;
     private ConsistencyLevel consistencyLevel = ConsistencyLevel.LOCAL_ONE;
     private int numFutures = 1000;
     private int inNumFutures = -1;
@@ -463,6 +452,14 @@ public class CqlDelimLoad {
 	    .withPoolingOptions(pOpts)
 	    .withLoadBalancingPolicy(new TokenAwarePolicy( DCAwareRoundRobinPolicy.builder().build()))
 	    ;
+		graphCluster = DseCluster.builder()
+				.addContactPoint(host)
+				.withGraphOptions(new GraphOptions().setGraphName("sgslitegraph"))
+				.build();
+		if (graphCluster != null){
+			System.out.println("creating the graph cluster session:");
+			graphSession = graphCluster.newSession();
+		}
 
 	if (null != username)
 	    clusterBuilder = clusterBuilder.withCredentials(username, password);
@@ -509,6 +506,15 @@ public class CqlDelimLoad {
 	if (null != cluster)
 	    cluster.close();
     }
+
+    private void graphSessionCleanUp() {
+		if (null != graphSession){
+			graphSession.close();
+		}
+		if (null != graphCluster){
+			graphCluster.close();
+		}
+	}
     
     public boolean run(String[] args) 
 	throws IOException, ParseException, InterruptedException, ExecutionException, KeyStoreException,
@@ -570,7 +576,7 @@ public class CqlDelimLoad {
 							 numRetries, queryTimeout,
 							 maxInsertErrors, 
 							 successDir, failureDir,
-							 nullsUnset);
+							 nullsUnset,graphSession);
 	    Future<Long> res = executor.submit(worker);
 	    total = res.get();
 	    executor.shutdown();
@@ -594,7 +600,7 @@ public class CqlDelimLoad {
 							     queryTimeout,
 							     maxInsertErrors, 
 							     successDir, failureDir,
-							     nullsUnset);
+							     nullsUnset, graphSession);
 		results.add(executor.submit(worker));
 	    }
 	    executor.shutdown();
@@ -604,6 +610,7 @@ public class CqlDelimLoad {
 
 	// Cleanup
 	cleanup();
+	graphSessionCleanUp();
 	//System.err.println("Total rows inserted: " + total);
 
 	return true;
